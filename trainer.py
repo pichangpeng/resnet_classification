@@ -12,13 +12,16 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import resnet
 from  dataset import ImageDataset
+from sklearn import metrics
+from sklearn.metrics import auc
+import matplotlib.pyplot as plt
 
+os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 
 model_names = sorted(name for name in resnet.__dict__
     if name.islower() and not name.startswith("__")
                      and name.startswith("resnet")
                      and callable(resnet.__dict__[name]))
-
 print(model_names)
 
 parser = argparse.ArgumentParser(description='Propert ResNets for CIFAR10 in pytorch')
@@ -26,9 +29,9 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet32',
                     choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) +
                     ' (default: resnet32)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=2, type=int, metavar='N',
+parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -89,7 +92,7 @@ def main():
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    transforms_ = [ transforms.Resize(400),
+    transforms_ = [ #transforms.Resize(400),
                     transforms.CenterCrop((320,320)), 
                     transforms.ToTensor(),
                     normalize]
@@ -100,8 +103,8 @@ def main():
         num_workers=args.workers, pin_memory=True)
 
     val_loader = torch.utils.data.DataLoader(
-        ImageDataset("../classification/testSet","../classification/test.json",[transforms.ToTensor(),normalize]),
-        batch_size=128, shuffle=False,
+        ImageDataset("../classification/testSet","../classification/test.json",transforms_),
+        batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
@@ -116,7 +119,7 @@ def main():
                                 weight_decay=args.weight_decay)
 
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                        milestones=[100, 150], last_epoch=args.start_epoch - 1)
+                                                        milestones=[int(args.epochs*0.4), int(args.epochs*0.8)], last_epoch=args.start_epoch - 1)
 
     if args.arch in ['resnet1202', 'resnet110']:
         # for resnet1202 original paper uses lr=0.01 for first 400 minibatches for warm-up
@@ -137,7 +140,7 @@ def main():
         lr_scheduler.step()
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
+        prec1 = validate(val_loader, model, criterion,epoch)
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
@@ -169,8 +172,12 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
 
     end = time.time()
-    for i, (input, target) in enumerate(train_loader):
-
+    # for i, (input, target) in enumerate(train_loader):
+    for i, batch in enumerate(train_loader):
+        input=batch["images"]
+        target=batch["labels"]
+        # print(input)
+        # print(target)
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -210,7 +217,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
                       data_time=data_time, loss=losses, top1=top1))
 
 
-def validate(val_loader, model, criterion):
+def validate(val_loader, model, criterion,epoch=0):
     """
     Run evaluation
     """
@@ -222,11 +229,15 @@ def validate(val_loader, model, criterion):
     model.eval()
 
     end = time.time()
+    output_=torch.Tensor()
+    target_=torch.Tensor()
     with torch.no_grad():
-        for i, (input, target) in enumerate(val_loader):
+        for i, batch in enumerate(val_loader):
+            input=batch["images"]
+            target=batch["labels"]
             target = target.cuda()
             input_var = input.cuda()
-            target_var = target.cuda()
+            target_var = target
 
             if args.half:
                 input_var = input_var.half()
@@ -234,10 +245,12 @@ def validate(val_loader, model, criterion):
             # compute output
             output = model(input_var)
             loss = criterion(output, target_var)
-
+            
             output = output.float()
             loss = loss.float()
-
+            
+            output_=torch.cat((output_,output.cpu()),0)
+            target_=torch.cat((target_,target.cpu()),0)
             # measure accuracy and record loss
             prec1 = accuracy(output.data, target)[0]
             losses.update(loss.item(), input.size(0))
@@ -254,7 +267,9 @@ def validate(val_loader, model, criterion):
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
                           i, len(val_loader), batch_time=batch_time, loss=losses,
                           top1=top1))
-
+    precision,recall=precision_recall(output_.data,target_)
+    roc(output_.data,target_,epoch)
+    print("Precision:{}\t" "Recall:{}\t".format(precision,recall))
     print(' * Prec@1 {top1.avg:.3f}'
           .format(top1=top1))
 
@@ -299,6 +314,74 @@ def accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
+def precision_recall(output,target,topk=(1,)):
+    precision=[]
+    recall=[]
+    correct=[0]*5
+    maxk = max(topk)
+    batch_size=target.size(0)
+    softmax_func=nn.Softmax(dim=1)
+    pre=softmax_func(output)
+    _, pred = pre.topk(maxk, 1, True, True)
+    target=target.numpy().tolist()
+    pred=pred.view(-1).numpy().tolist()
+    for i in range(batch_size):
+        if target[i]==pred[i]:
+            correct[int(target[i])]=correct[int(target[i])]+1
+    for i in range(5):
+        pred_count=pred.count(i)
+        target_count=target.count(i)
+        if pred_count==0:
+            precision.append(-1)
+        else:
+            precision.append(correct[i]/pred.count(i))
+        if target_count==0:
+            recall.append(-1)
+        else:
+            recall.append(correct[i]/target.count(i))
+    return precision,recall
+
+def roc(output,target,epoch,topk=(5,)):
+    if not os.path.exists("./roc"):
+        os.makedirs("./roc")
+    score=[]
+    maxk = max(topk)
+    batch_size=target.size(0)
+    target=target.numpy().tolist()
+    softmax_func=nn.Softmax(dim=1)
+    pre=softmax_func(output).numpy()
+    for i in range(batch_size):
+        score.append(pre[i][int(target[i])])
+    plt.figure()
+    for cls in range(maxk):
+        fpr, tpr, _ = metrics.roc_curve(target, score, pos_label=cls)
+        # auc = auc(fpr, tpr)
+        # print("AUC : ", auc)
+        plt.plot(fpr, tpr, label="%d"%cls,color=["r","b","y","g","c"][cls])
+    plt.xlabel('False positive rate')
+    plt.ylabel('True positive rate')
+    plt.title('ROC curve')
+    plt.legend(loc='best')
+    plt.savefig("./roc/roc_%d.png"%epoch)
+    plt.show()
 
 if __name__ == '__main__':
     main()
+    # pre=torch.rand(10,5)
+    # target=torch.tensor([0,1,3,2,4,0,4,2,1,3])
+    # a=torch.Tensor()
+    # print(torch.cat((target,target),0))
+    # print(pre)
+    # print(target)
+    # softmax_func=nn.Softmax(dim=1)
+    # pre=softmax_func(pre)
+    # print(pre)
+    # print(pre[:,target.numpy().tolist()])
+    # _, pred = pre.topk(5, 1, True, True)
+    # print(_)
+    # print(pred)
+    # print(target.numpy().tolist().count(1))
+    # precision,recall=precision_recall(pre,target)
+    # print(precision)
+    # print(recall)
+    # roc(pre,target)
