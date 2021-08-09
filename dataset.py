@@ -22,7 +22,24 @@ class ImageDataset(Dataset):
         image_name=self.files[index % len(self.files)]
         image=self.transforms(Image.open(image_name).convert('RGB'))
         label=self.image_lab_dict[image_name.split("/")[-1]]
-        return {"images":image,"labels":torch.tensor(label)}
+        if label>=3:
+            label=label-1
+        return {"images":image,"labels":torch.tensor(label),"image_names":image_name.split("/")[-1]}
 
     def __len__(self):
         return len(self.files)
+
+if __name__=="__main__":
+    transforms_ = [ transforms.Resize(400),
+                    transforms.CenterCrop((320,320)), 
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))]
+    a=ImageDataset("../classification/trainSet","../classification/train.json",transforms_)
+    b=a.__getitem__(1)
+    print(b)
+    dataloader = DataLoader(a,batch_size=2, shuffle=True)
+    for i, batch in enumerate(dataloader):
+        print(batch)
+        i+=1
+        if i==10:
+            break

@@ -2,6 +2,8 @@ import argparse
 import os
 import shutil
 import time
+from torchvision.transforms.transforms import Pad
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -16,7 +18,7 @@ from sklearn import metrics
 from sklearn.metrics import auc
 import matplotlib.pyplot as plt
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '4'
+os.environ['CUDA_VISIBLE_DEVICES'] = '6,7'
 
 model_names = sorted(name for name in resnet.__dict__
     if name.islower() and not name.startswith("__")
@@ -29,13 +31,13 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet32',
                     choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) +
                     ' (default: resnet32)')
-parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=10, type=int,
+parser.add_argument('-b', '--batch-size', default=24, type=int,
                     metavar='N', help='mini-batch size (default: 128)')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
@@ -53,23 +55,21 @@ parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
 parser.add_argument('--half', dest='half', action='store_true',
                     help='use half-precision(16-bit) ')
-parser.add_argument('--save-dir', dest='save_dir',
-                    help='The directory used to save the trained models',
-                    default='save_temp', type=str)
 parser.add_argument('--save-every', dest='save_every',
                     help='Saves checkpoints at every specified number of epochs',
                     type=int, default=10)
+parser.add_argument('--threshold',default=0.3, type=float,help="the threshold of computing the precision and recall")
+parser.add_argument('--num-cls',default=4, type=int,help="the num of class")
 best_prec1 = 0
-
+args = parser.parse_args()
 
 def main():
     global args, best_prec1
-    args = parser.parse_args()
 
 
     # Check the save_dir exists or not
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
+    if not os.path.exists(args.arch):
+        os.makedirs(args.arch)
 
     model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
     model.cuda()
@@ -92,7 +92,8 @@ def main():
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    transforms_ = [ #transforms.Resize(400),
+    transforms_ = [ transforms.Pad(40),
+                    transforms.Resize(400),
                     transforms.CenterCrop((320,320)), 
                     transforms.ToTensor(),
                     normalize]
@@ -108,7 +109,7 @@ def main():
         num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss(torch.tensor([1,0.2,0.3,0.1])).cuda()
 
     if args.half:
         model.half()
@@ -151,12 +152,12 @@ def main():
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'best_prec1': best_prec1,
-            }, is_best, filename=os.path.join(args.save_dir, 'checkpoint.th'))
+            }, is_best, filename=os.path.join(args.arch, 'checkpoint.th'))
 
         save_checkpoint({
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
-        }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
+        }, is_best, filename=os.path.join(args.arch, 'model.th'))
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
@@ -231,10 +232,12 @@ def validate(val_loader, model, criterion,epoch=0):
     end = time.time()
     output_=torch.Tensor()
     target_=torch.Tensor()
+    image_name_=[]
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
             input=batch["images"]
             target=batch["labels"]
+            image_name=batch["image_names"]
             target = target.cuda()
             input_var = input.cuda()
             target_var = target
@@ -251,6 +254,7 @@ def validate(val_loader, model, criterion,epoch=0):
             
             output_=torch.cat((output_,output.cpu()),0)
             target_=torch.cat((target_,target.cpu()),0)
+            image_name_.extend(image_name)
             # measure accuracy and record loss
             prec1 = accuracy(output.data, target)[0]
             losses.update(loss.item(), input.size(0))
@@ -267,9 +271,16 @@ def validate(val_loader, model, criterion,epoch=0):
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
                           i, len(val_loader), batch_time=batch_time, loss=losses,
                           top1=top1))
-    precision,recall=precision_recall(output_.data,target_)
+    precision,recall,hard_negative=precision_recall(output_.data,target_,image_name_)
     roc(output_.data,target_,epoch)
-    print("Precision:{}\t" "Recall:{}\t".format(precision,recall))
+
+    if not os.path.exists("%s/hard_negative/%d"%(args.arch,epoch)):
+        os.makedirs("%s/hard_negative/%d"%(args.arch,epoch))
+    for i,name_info in tqdm(enumerate(hard_negative)):
+        name=name_info[0]
+        info=name_info[1]
+        shutil.copyfile("../classification/testSet/%s"%name,"./%s/hard_negative/%d/%d_%s"%(args.arch,epoch+1,i+1,info+"."+name.split(".")[-1]))
+    print("Precision:{}\t" "Recall:{}\t" "hard_negative num:{}\t".format(precision,recall,len(hard_negative)))
     print(' * Prec@1 {top1.avg:.3f}'
           .format(top1=top1))
 
@@ -314,21 +325,28 @@ def accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
-def precision_recall(output,target,topk=(1,)):
+def precision_recall(output,target,image_name_,topk=(1,)):
     precision=[]
     recall=[]
-    correct=[0]*5
+    hard_negitive=[]
+    correct=[0]*args.num_cls
     maxk = max(topk)
     batch_size=target.size(0)
     softmax_func=nn.Softmax(dim=1)
     pre=softmax_func(output)
-    _, pred = pre.topk(maxk, 1, True, True)
+    prob, pred = pre.topk(maxk, 1, True, True)
     target=target.numpy().tolist()
+    prob=prob.view(-1).numpy().tolist()
     pred=pred.view(-1).numpy().tolist()
     for i in range(batch_size):
-        if target[i]==pred[i]:
-            correct[int(target[i])]=correct[int(target[i])]+1
-    for i in range(5):
+        if prob[i]>args.threshold:
+            if target[i]==pred[i]:
+                correct[int(target[i])]=correct[int(target[i])]+1
+            else:
+                hard_negitive.append([image_name_[i],"%d_%d"%(target[i],pred[i])])
+        else:
+            hard_negitive.append([image_name_[i],"%d_%d"%(target[i],pred[i])])
+    for i in range(args.num_cls):
         pred_count=pred.count(i)
         target_count=target.count(i)
         if pred_count==0:
@@ -339,11 +357,11 @@ def precision_recall(output,target,topk=(1,)):
             recall.append(-1)
         else:
             recall.append(correct[i]/target.count(i))
-    return precision,recall
+    return precision,recall,hard_negitive
 
-def roc(output,target,epoch,topk=(5,)):
-    if not os.path.exists("./roc"):
-        os.makedirs("./roc")
+def roc(output,target,epoch,topk=(args.num_cls,)):
+    if not os.path.exists("%s/roc"%args.arch):
+        os.makedirs("%s/roc"%args.arch)
     score=[]
     maxk = max(topk)
     batch_size=target.size(0)
@@ -355,14 +373,12 @@ def roc(output,target,epoch,topk=(5,)):
     plt.figure()
     for cls in range(maxk):
         fpr, tpr, _ = metrics.roc_curve(target, score, pos_label=cls)
-        # auc = auc(fpr, tpr)
-        # print("AUC : ", auc)
         plt.plot(fpr, tpr, label="%d"%cls,color=["r","b","y","g","c"][cls])
     plt.xlabel('False positive rate')
     plt.ylabel('True positive rate')
     plt.title('ROC curve')
     plt.legend(loc='best')
-    plt.savefig("./roc/roc_%d.png"%epoch)
+    plt.savefig("%s/roc/roc_%d.png"%(args.arch,epoch+1))
     plt.show()
 
 if __name__ == '__main__':
